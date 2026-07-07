@@ -1,8 +1,0 @@
-currency50converterbot/
-├── bot.py          # Main bot code
-├── config.py       # Configuration settings
-├── utils.py        # Utility functions
-├── requirements.txt
-├── Procfile
-├── .env.example    # Environment variables template
-└── README.md
