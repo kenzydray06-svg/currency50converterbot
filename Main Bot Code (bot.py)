@@ -1,8 +1,10 @@
 import os
 import logging
 import sys
-from datetime import datetime
-from typing import Optional, Dict, Any
+import json
+import requests
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List
 
 from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import (
@@ -10,15 +12,21 @@ from telegram.ext import (
     CommandHandler,
     InlineQueryHandler,
     ContextTypes,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
 )
 
-from config import Config
-from utils import CurrencyConverter, format_amount, get_currency_symbol
+# ============ CONFIGURATION ============
+# Get token from environment variable
+TOKEN = os.environ.get('TELEGRAM_TOKEN')
 
-# Configure logging
+if not TOKEN:
+    print("❌ ERROR: TELEGRAM_TOKEN not set in environment variables")
+    print("Please set it in Railway: Variables tab -> TELEGRAM_TOKEN")
+    sys.exit(1)
+
+# API Configuration
+CURRENCY_API = "https://api.exchangerate-api.com/v4/latest/"
+
+# ============ LOGGING ============
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
@@ -28,460 +36,405 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class CurrencyBot:
-    """Main bot class for currency conversion"""
+# ============ CURRENCY DATA ============
+# Currency symbols for display
+CURRENCY_SYMBOLS = {
+    'USD': '$', 'EUR': '€', 'GBP': '£', 'JPY': '¥',
+    'CNY': '¥', 'INR': '₹', 'CAD': 'C$', 'AUD': 'A$',
+    'CHF': 'Fr', 'NZD': 'NZ$', 'KRW': '₩', 'RUB': '₽',
+    'BRL': 'R$', 'MXN': '$', 'SGD': 'S$', 'HKD': 'HK$',
+    'SEK': 'kr', 'NOK': 'kr', 'DKK': 'kr', 'PLN': 'zł',
+    'TRY': '₺', 'THB': '฿', 'IDR': 'Rp', 'MYR': 'RM',
+    'PHP': '₱', 'VND': '₫', 'AED': 'د.إ', 'SAR': 'ر.س',
+    'ZAR': 'R', 'NGN': '₦', 'EGP': 'E£', 'KWD': 'KD',
+}
+
+# Common currencies for display
+COMMON_CURRENCIES = ['USD', 'EUR', 'GBP', 'JPY', 'CNY', 'INR', 'CAD', 'AUD', 'CHF', 'NZD']
+
+# ============ CACHE ============
+rate_cache = {
+    'data': None,
+    'timestamp': None,
+    'base': None
+}
+
+def get_exchange_rates(base: str = 'USD') -> Optional[Dict]:
+    """Fetch exchange rates with caching"""
+    current_time = datetime.now()
     
-    def __init__(self):
-        """Initialize the bot with configuration"""
-        self.config = Config()
-        self.converter = CurrencyConverter()
-        self.application = None
+    # Check cache
+    if (rate_cache['data'] and 
+        rate_cache['timestamp'] and 
+        rate_cache['base'] == base):
         
-        # Validate token
-        if not self.config.TELEGRAM_TOKEN:
-            logger.error("TELEGRAM_TOKEN not set in environment variables")
-            raise ValueError("TELEGRAM_TOKEN is required")
-        
-        logger.info("Currency Bot initialized successfully")
+        elapsed = (current_time - rate_cache['timestamp']).total_seconds()
+        if elapsed < 3600:  # 1 hour cache
+            logger.debug(f"Using cached rates for {base}")
+            return rate_cache['data']['rates']
     
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
-        user = update.effective_user
-        welcome_text = f"""
+    # Fetch new rates
+    try:
+        logger.info(f"Fetching rates for {base}...")
+        response = requests.get(f"{CURRENCY_API}{base}", timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            rate_cache['data'] = data
+            rate_cache['timestamp'] = current_time
+            rate_cache['base'] = base
+            logger.info(f"Successfully fetched rates for {base}")
+            return data['rates']
+        else:
+            logger.error(f"API error: {response.status_code}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error fetching rates: {e}")
+        # Return cached data if available
+        if rate_cache['data']:
+            logger.warning("Using stale cache")
+            return rate_cache['data']['rates']
+        return None
+
+def convert_currency(amount: float, from_curr: str, to_curr: str) -> Optional[float]:
+    """Convert currency"""
+    try:
+        rates = get_exchange_rates(from_curr)
+        if not rates or to_curr not in rates:
+            return None
+        
+        result = amount * rates[to_curr]
+        return round(result, 2)
+    except Exception as e:
+        logger.error(f"Conversion error: {e}")
+        return None
+
+def get_symbol(currency: str) -> str:
+    """Get currency symbol"""
+    return CURRENCY_SYMBOLS.get(currency, currency)
+
+def format_number(num: float) -> str:
+    """Format number with commas"""
+    if num == int(num):
+        return f"{num:,.0f}"
+    return f"{num:,.2f}"
+
+# ============ BOT HANDLERS ============
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    user = update.effective_user
+    welcome = f"""
 🌟 **Welcome to Currency50 Converter Bot!** 🌟
 
-Hello {user.first_name}! I'm your reliable currency converter.
+Hello {user.first_name}! I help you convert currencies instantly.
 
-**📊 Available Commands:**
-• `/start` - Show this welcome message
-• `/help` - Get detailed help and usage guide
-• `/convert` - Convert currency (format: `/convert 100 USD EUR`)
-• `/rates` - Show current exchange rates
-• `/list` - List all supported currencies
-• `/about` - About this bot
+**Commands:**
+/start - Show this message
+/help - Get help
+/convert [amount] [from] [to] - Convert currency
+/rates - Show exchange rates
+/list - List all currencies
 
-**💡 Examples:**
-• `/convert 50 USD EUR` - Convert 50 USD to EUR
-• `/convert 1000 JPY GBP` - Convert 1000 JPY to GBP
-• `@currency50converterbot 100 USD INR` - Use inline mode
+**Examples:**
+/convert 100 USD EUR
+/convert 50.5 GBP JPY
 
-**🔄 Features:**
-• Real-time exchange rates
-• 150+ currencies supported
-• Inline mode support
-• Rate caching for speed
-• Clean, formatted responses
+**Inline Mode:**
+@currency50converterbot 100 USD EUR
 
 *Powered by ExchangeRate-API.com*
-        """
-        await update.message.reply_text(welcome_text, parse_mode='Markdown')
-        logger.info(f"User {user.id} started the bot")
-    
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /help command"""
-        help_text = """
-📖 **Currency50 Converter Bot - Help Guide**
+    """
+    await update.message.reply_text(welcome, parse_mode='Markdown')
 
-**🔹 Quick Conversion**
-Format: `/convert [amount] [from_currency] [to_currency]`
-Example: `/convert 100 USD EUR`
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command"""
+    help_text = """
+📖 **How to use Currency50 Converter Bot**
 
-**🔹 View Exchange Rates**
-Format: `/rates` or `/rates [currency]`
-Example: `/rates USD` shows rates for USD
+**Quick Conversion:**
+/convert [amount] [from] [to]
 
-**🔹 List Currencies**
-Format: `/list` - Shows all supported currencies
+**Examples:**
+/convert 100 USD EUR
+/convert 50 GBP JPY
+/convert 1000 JPY USD
 
-**🔹 About Bot**
-Format: `/about` - Bot information
+**View Rates:**
+/rates - Show rates for major currencies
 
-**🔹 Inline Mode**
-Type `@currency50converterbot 100 USD EUR` in any chat
+**List Currencies:**
+/list - Show all supported currencies
 
-**📝 Important Notes:**
-• Use standard 3-letter currency codes (USD, EUR, GBP, etc.)
-• Amount can be decimal (e.g., 15.50, 100.25)
-• Rates update automatically every hour
+**Inline Mode:**
+Type @currency50converterbot 100 USD EUR in any chat
+
+**Tips:**
+• Use 3-letter currency codes (USD, EUR, GBP, etc.)
+• Amount can be decimal (e.g., 15.50)
 • Case insensitive (usd = USD)
+    """
+    await update.message.reply_text(help_text, parse_mode='Markdown')
 
-**❓ Need more help?**
-Contact: [Bot Support](https://t.me/YourSupportChannel)
-        """
-        await update.message.reply_text(help_text, parse_mode='Markdown')
-    
-    async def convert_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /convert command"""
+async def convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /convert command"""
+    try:
+        args = context.args
+        
+        if len(args) != 3:
+            await update.message.reply_text(
+                "❌ **Invalid format!**\n\n"
+                "Use: `/convert [amount] [from] [to]`\n"
+                "Example: `/convert 100 USD EUR`",
+                parse_mode='Markdown'
+            )
+            return
+        
+        # Parse amount
         try:
-            args = context.args
-            
-            # Validate arguments
-            if len(args) != 3:
-                await update.message.reply_text(
-                    "❌ **Invalid format!**\n\n"
-                    "Please use: `/convert [amount] [from] [to]`\n\n"
-                    "Example: `/convert 100 USD EUR`\n"
-                    "Example: `/convert 50.5 GBP JPY`",
-                    parse_mode='Markdown'
-                )
-                return
-            
-            # Parse arguments
-            try:
-                amount = float(args[0])
-            except ValueError:
-                await update.message.reply_text(
-                    "❌ **Invalid amount!**\n\n"
-                    f"'{args[0]}' is not a valid number.\n"
-                    "Please use a valid number (e.g., 100 or 50.5)",
-                    parse_mode='Markdown'
-                )
-                return
-            
-            from_currency = args[1].upper()
-            to_currency = args[2].upper()
-            
-            # Validate currency codes
-            if not self.converter.is_valid_currency(from_currency):
-                await update.message.reply_text(
-                    f"❌ **Invalid currency code!**\n\n"
-                    f"'{from_currency}' is not supported.\n"
-                    "Use `/list` to see all supported currencies.",
-                    parse_mode='Markdown'
-                )
-                return
-            
-            if not self.converter.is_valid_currency(to_currency):
-                await update.message.reply_text(
-                    f"❌ **Invalid currency code!**\n\n"
-                    f"'{to_currency}' is not supported.\n"
-                    "Use `/list` to see all supported currencies.",
-                    parse_mode='Markdown'
-                )
-                return
-            
-            # Perform conversion
-            result = self.converter.convert(amount, from_currency, to_currency)
-            
-            if result is None:
-                await update.message.reply_text(
-                    "❌ **Conversion failed!**\n\n"
-                    "Unable to fetch exchange rates. Please try again later.",
-                    parse_mode='Markdown'
-                )
-                return
-            
-            # Get currency symbols
-            from_symbol = get_currency_symbol(from_currency) or from_currency
-            to_symbol = get_currency_symbol(to_currency) or to_currency
-            
-            # Format response
-            rate = result / amount
-            response = f"""
+            amount = float(args[0])
+        except ValueError:
+            await update.message.reply_text(
+                f"❌ Invalid amount: '{args[0]}'\n"
+                "Please enter a valid number.",
+                parse_mode='Markdown'
+            )
+            return
+        
+        from_curr = args[1].upper()
+        to_curr = args[2].upper()
+        
+        # Convert
+        result = convert_currency(amount, from_curr, to_curr)
+        
+        if result is None:
+            await update.message.reply_text(
+                f"❌ Conversion failed!\n\n"
+                f"Please check currency codes: {from_curr} → {to_curr}\n"
+                "Use /list to see supported currencies.",
+                parse_mode='Markdown'
+            )
+            return
+        
+        # Format response
+        from_symbol = get_symbol(from_curr)
+        to_symbol = get_symbol(to_curr)
+        rate = result / amount
+        
+        response = f"""
 💱 **Conversion Result**
 
-**{format_amount(amount)}** {from_symbol} = **{format_amount(result)}** {to_symbol}
+{format_number(amount)} {from_symbol} ({from_curr}) = **{format_number(result)}** {to_symbol} ({to_curr})
 
-📊 **Exchange Rate:** 1 {from_currency} = {format_amount(rate)} {to_currency}
-🕐 **Updated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-            """
-            
-            await update.message.reply_text(response, parse_mode='Markdown')
-            logger.info(f"Converted {amount} {from_currency} to {to_currency} = {result}")
-            
-        except Exception as e:
-            logger.error(f"Conversion error: {e}")
-            await update.message.reply_text(
-                "❌ **An error occurred!**\n\n"
-                "Please try again later or use `/help` for guidance.",
-                parse_mode='Markdown'
-            )
-    
-    async def rates_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /rates command"""
-        try:
-            # Check if specific currency requested
-            base_currency = 'USD'
-            if context.args and len(context.args) > 0:
-                base_currency = context.args[0].upper()
-                if not self.converter.is_valid_currency(base_currency):
-                    await update.message.reply_text(
-                        f"❌ **Invalid currency!**\n\n"
-                        f"'{base_currency}' is not supported.\n"
-                        "Use `/list` to see all supported currencies.",
-                        parse_mode='Markdown'
-                    )
-                    return
-            
-            rates_data = self.converter.get_rates(base_currency)
-            
-            if not rates_data:
-                await update.message.reply_text(
-                    "❌ **Unable to fetch rates!**\n\n"
-                    "Please try again later.",
-                    parse_mode='Markdown'
-                )
-                return
-            
-            # Get rates for major currencies
-            major_currencies = ['USD', 'EUR', 'GBP', 'JPY', 'CNY', 'INR', 'CAD', 'AUD', 'CHF', 'NZD']
-            
-            response = f"📈 **Exchange Rates (Base: {base_currency})**\n\n"
-            
-            for currency in major_currencies:
-                if currency in rates_data:
-                    rate = rates_data[currency]
-                    symbol = get_currency_symbol(currency) or currency
-                    response += f"• **{symbol}** ({currency}): {format_amount(rate)}\n"
-            
-            response += f"\n🕐 **Updated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            
-            await update.message.reply_text(response, parse_mode='Markdown')
-            
-        except Exception as e:
-            logger.error(f"Rates command error: {e}")
-            await update.message.reply_text(
-                "❌ **An error occurred!**\n\n"
-                "Please try again later.",
-                parse_mode='Markdown'
-            )
-    
-    async def list_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /list command"""
-        try:
-            currencies = self.converter.get_all_currencies()
-            
-            if not currencies:
-                await update.message.reply_text(
-                    "❌ **Unable to fetch currencies!**\n\n"
-                    "Please try again later.",
-                    parse_mode='Markdown'
-                )
-                return
-            
-            # Group currencies alphabetically
-            currencies.sort()
-            
-            # Split into chunks for better display
-            chunks = [currencies[i:i+15] for i in range(0, len(currencies), 15)]
-            
-            response = "📋 **Supported Currencies**\n\n"
-            response += f"Total: {len(currencies)} currencies\n\n"
-            
-            for chunk in chunks[:5]:  # Show first 5 chunks (75 currencies)
-                response += "• " + "\n• ".join(chunk) + "\n\n"
-            
-            if len(chunks) > 5:
-                response += f"... and {len(currencies) - 75} more currencies\n\n"
-            
-            response += "💡 **Tip:** Use `/convert 100 USD EUR` to convert"
-            
-            await update.message.reply_text(response, parse_mode='Markdown')
-            
-        except Exception as e:
-            logger.error(f"List command error: {e}")
-            await update.message.reply_text(
-                "❌ **An error occurred!**\n\n"
-                "Please try again later.",
-                parse_mode='Markdown'
-            )
-    
-    async def about_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /about command"""
-        about_text = """
-ℹ️ **About Currency50 Converter Bot**
-
-**Version:** 1.0.0
-**Creator:** Currency50 Project
-**Status:** 🟢 Active
-
-**Features:**
-• Real-time currency conversion
-• 150+ currencies supported
-• Inline mode for quick conversions
-• Exchange rate history
-• Clean, user-friendly interface
-
-**Technologies:**
-• Python 3.11
-• python-telegram-bot v20.7
-• ExchangeRate-API.com
-• Deployed on Railway
-
-**Privacy Policy:**
-We don't store any user data. All conversions are processed in real-time.
-
-**🔗 Links:**
-• [GitHub Repository](https://github.com/yourusername/currency50converterbot)
-• [Report Issue](https://github.com/yourusername/currency50converterbot/issues)
-
-*Made with ❤️ by Currency50 Team*
+📊 Rate: 1 {from_curr} = {format_number(rate)} {to_curr}
+🕐 Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         """
-        await update.message.reply_text(about_text, parse_mode='Markdown')
-    
-    async def inline_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle inline queries"""
-        query = update.inline_query.query.strip()
         
-        if not query:
-            # Show help for empty query
-            results = [
-                InlineQueryResultArticle(
-                    id="1",
-                    title="💱 Quick Currency Converter",
-                    description="Type: 100 USD EUR",
-                    input_message_content=InputTextMessageContent(
-                        "📝 **Usage:**\n"
-                        "Type `100 USD EUR` to convert\n"
-                        "Example: `50 GBP JPY`",
-                        parse_mode='Markdown'
-                    )
-                )
-            ]
-            await update.inline_query.answer(results)
-            return
+        await update.message.reply_text(response, parse_mode='Markdown')
+        logger.info(f"Converted {amount} {from_curr} to {to_curr}")
         
-        parts = query.split()
-        
-        if len(parts) != 3:
-            results = [
-                InlineQueryResultArticle(
-                    id="1",
-                    title="❌ Invalid format",
-                    description="Use: [amount] [from] [to]",
-                    input_message_content=InputTextMessageContent(
-                        "❌ **Invalid format!**\n\n"
-                        "Please use: `[amount] [from] [to]`\n"
-                        "Example: `100 USD EUR`",
-                        parse_mode='Markdown'
-                    )
-                )
-            ]
-            await update.inline_query.answer(results)
-            return
-        
-        try:
-            amount = float(parts[0])
-            from_currency = parts[1].upper()
-            to_currency = parts[2].upper()
-            
-            # Validate currencies
-            if not (self.converter.is_valid_currency(from_currency) and 
-                   self.converter.is_valid_currency(to_currency)):
-                results = [
-                    InlineQueryResultArticle(
-                        id="1",
-                        title="❌ Invalid currency",
-                        description="Please check currency codes",
-                        input_message_content=InputTextMessageContent(
-                            "❌ **Invalid currency code!**\n\n"
-                            "Please use valid 3-letter currency codes.",
-                            parse_mode='Markdown'
-                        )
-                    )
-                ]
-                await update.inline_query.answer(results)
-                return
-            
-            # Perform conversion
-            result = self.converter.convert(amount, from_currency, to_currency)
-            
-            if result is None:
-                return
-            
-            # Create inline result
-            from_symbol = get_currency_symbol(from_currency) or from_currency
-            to_symbol = get_currency_symbol(to_currency) or to_currency
-            
-            result_text = f"💱 {format_amount(amount)} {from_symbol} = {format_amount(result)} {to_symbol}"
-            
-            results = [
-                InlineQueryResultArticle(
-                    id="1",
-                    title=result_text,
-                    description=f"Rate: 1 {from_currency} = {format_amount(result/amount)} {to_currency}",
-                    input_message_content=InputTextMessageContent(
-                        f"{result_text}\n\n"
-                        f"📊 Rate: 1 {from_currency} = {format_amount(result/amount)} {to_currency}\n"
-                        f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                    )
-                )
-            ]
-            
-            await update.inline_query.answer(results)
-            logger.info(f"Inline conversion: {amount} {from_currency} to {to_currency}")
-            
-        except ValueError:
-            results = [
-                InlineQueryResultArticle(
-                    id="1",
-                    title="❌ Invalid amount",
-                    description="Please enter a valid number",
-                    input_message_content=InputTextMessageContent(
-                        "❌ **Invalid amount!**\n\n"
-                        "Please enter a valid number.\n"
-                        "Example: `100 USD EUR`",
-                        parse_mode='Markdown'
-                    )
-                )
-            ]
-            await update.inline_query.answer(results)
-        except Exception as e:
-            logger.error(f"Inline query error: {e}")
-    
-    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle errors"""
-        logger.error(f"Update {update} caused error {context.error}")
-        
-        # Send error message to user if possible
-        if update and update.effective_message:
-            await update.effective_message.reply_text(
-                "❌ **An error occurred!**\n\n"
-                "Please try again later or contact support.",
-                parse_mode='Markdown'
-            )
-    
-    def setup_handlers(self):
-        """Setup all command handlers"""
-        self.application = Application.builder().token(self.config.TELEGRAM_TOKEN).build()
-        
-        # Command handlers
-        self.application.add_handler(CommandHandler("start", self.start_command))
-        self.application.add_handler(CommandHandler("help", self.help_command))
-        self.application.add_handler(CommandHandler("convert", self.convert_command))
-        self.application.add_handler(CommandHandler("rates", self.rates_command))
-        self.application.add_handler(CommandHandler("list", self.list_command))
-        self.application.add_handler(CommandHandler("about", self.about_command))
-        
-        # Inline query handler
-        self.application.add_handler(InlineQueryHandler(self.inline_query))
-        
-        # Error handler
-        self.application.add_error_handler(self.error_handler)
-        
-        logger.info("Handlers setup completed")
-    
-    def run(self):
-        """Start the bot"""
-        self.setup_handlers()
-        
-        logger.info("Starting Currency Bot...")
-        logger.info(f"Bot username: @currency50converterbot")
-        
-        # Start the bot with long polling
-        self.application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
+    except Exception as e:
+        logger.error(f"Convert error: {e}")
+        await update.message.reply_text(
+            "❌ An error occurred. Please try again later."
         )
 
-def main():
-    """Main entry point"""
+async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /rates command"""
     try:
-        bot = CurrencyBot()
-        bot.run()
+        rates_data = get_exchange_rates()
+        if not rates_data:
+            await update.message.reply_text(
+                "❌ Unable to fetch rates. Please try again later."
+            )
+            return
+        
+        response = "📈 **Current Exchange Rates**\n\n"
+        response += f"Base: USD\n\n"
+        
+        for currency in COMMON_CURRENCIES:
+            if currency in rates_data:
+                rate = rates_data[currency]
+                symbol = get_symbol(currency)
+                response += f"• {symbol} {currency}: {format_number(rate)}\n"
+        
+        response += f"\n🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
+        await update.message.reply_text(response, parse_mode='Markdown')
+        
     except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
-        sys.exit(1)
+        logger.error(f"Rates error: {e}")
+        await update.message.reply_text("❌ An error occurred. Please try again later.")
+
+async def list_currencies(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /list command"""
+    try:
+        rates_data = get_exchange_rates()
+        if not rates_data:
+            await update.message.reply_text(
+                "❌ Unable to fetch currencies. Please try again later."
+            )
+            return
+        
+        currencies = sorted(rates_data.keys())
+        
+        response = f"📋 **Supported Currencies**\n\n"
+        response += f"Total: {len(currencies)} currencies\n\n"
+        
+        # Show first 50 currencies
+        shown = currencies[:50]
+        response += "• " + "\n• ".join(shown)
+        
+        if len(currencies) > 50:
+            response += f"\n\n... and {len(currencies) - 50} more currencies"
+        
+        response += "\n\n💡 Use /convert to convert currencies"
+        
+        await update.message.reply_text(response, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"List error: {e}")
+        await update.message.reply_text("❌ An error occurred. Please try again later.")
+
+async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline queries"""
+    query = update.inline_query.query.strip()
+    
+    if not query:
+        # Show help
+        results = [
+            InlineQueryResultArticle(
+                id="1",
+                title="💱 Currency Converter",
+                description="Type: 100 USD EUR",
+                input_message_content=InputTextMessageContent(
+                    "📝 **Usage:**\n"
+                    "Type `100 USD EUR` to convert\n"
+                    "Example: `50 GBP JPY`",
+                    parse_mode='Markdown'
+                )
+            )
+        ]
+        await update.inline_query.answer(results)
+        return
+    
+    parts = query.split()
+    
+    if len(parts) != 3:
+        results = [
+            InlineQueryResultArticle(
+                id="1",
+                title="❌ Invalid format",
+                description="Use: [amount] [from] [to]",
+                input_message_content=InputTextMessageContent(
+                    "❌ **Invalid format!**\n\n"
+                    "Use: `[amount] [from] [to]`\n"
+                    "Example: `100 USD EUR`",
+                    parse_mode='Markdown'
+                )
+            )
+        ]
+        await update.inline_query.answer(results)
+        return
+    
+    try:
+        amount = float(parts[0])
+        from_curr = parts[1].upper()
+        to_curr = parts[2].upper()
+        
+        result = convert_currency(amount, from_curr, to_curr)
+        
+        if result is None:
+            results = [
+                InlineQueryResultArticle(
+                    id="1",
+                    title="❌ Invalid currency",
+                    description="Please check currency codes",
+                    input_message_content=InputTextMessageContent(
+                        "❌ **Invalid currency!**\n\n"
+                        "Please use valid 3-letter currency codes.\n"
+                        "Example: `100 USD EUR`",
+                        parse_mode='Markdown'
+                    )
+                )
+            ]
+            await update.inline_query.answer(results)
+            return
+        
+        # Success
+        from_symbol = get_symbol(from_curr)
+        to_symbol = get_symbol(to_curr)
+        
+        result_text = f"💱 {format_number(amount)} {from_symbol} = {format_number(result)} {to_symbol}"
+        
+        results = [
+            InlineQueryResultArticle(
+                id="1",
+                title=result_text,
+                description=f"Rate: 1 {from_curr} = {format_number(result/amount)} {to_curr}",
+                input_message_content=InputTextMessageContent(
+                    f"{result_text}\n\n"
+                    f"📊 Rate: 1 {from_curr} = {format_number(result/amount)} {to_curr}\n"
+                    f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+            )
+        ]
+        
+        await update.inline_query.answer(results)
+        logger.info(f"Inline: {amount} {from_curr} → {to_curr}")
+        
+    except ValueError:
+        results = [
+            InlineQueryResultArticle(
+                id="1",
+                title="❌ Invalid amount",
+                description="Please enter a valid number",
+                input_message_content=InputTextMessageContent(
+                    "❌ **Invalid amount!**\n\n"
+                    "Please enter a valid number.\n"
+                    "Example: `100 USD EUR`",
+                    parse_mode='Markdown'
+                )
+            )
+        ]
+        await update.inline_query.answer(results)
+    except Exception as e:
+        logger.error(f"Inline error: {e}")
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors"""
+    logger.error(f"Update {update} caused error {context.error}")
+    if update and update.effective_message:
+        await update.effective_message.reply_text(
+            "❌ An error occurred. Please try again later."
+        )
+
+# ============ MAIN ============
+
+def main():
+    """Start the bot"""
+    logger.info("🚀 Starting Currency50 Converter Bot...")
+    logger.info(f"Bot token: {'✓' if TOKEN else '✗'}")
+    
+    # Create application
+    app = Application.builder().token(TOKEN).build()
+    
+    # Add handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("convert", convert))
+    app.add_handler(CommandHandler("rates", rates))
+    app.add_handler(CommandHandler("list", list_currencies))
+    app.add_handler(InlineQueryHandler(inline_query))
+    app.add_error_handler(error_handler)
+    
+    logger.info("✅ Bot is ready!")
+    logger.info("📱 Bot username: @currency50converterbot")
+    logger.info("🔄 Starting polling...")
+    
+    # Start polling
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
